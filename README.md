@@ -1,8 +1,28 @@
 # 豆包输入法语音快捷切换
 
+[![macOS](https://img.shields.io/badge/macOS-automation-111827)](https://www.apple.com/macos/)
+[![Swift](https://img.shields.io/badge/Swift-helper-orange)](https://www.swift.org/)
+[![Keyboard Maestro](https://img.shields.io/badge/Keyboard%20Maestro-supported-blue)](https://www.keyboardmaestro.com/)
+
 这个小工具配合 Keyboard Maestro 使用：按一次快捷键切到豆包输入法并打开语音输入，再按一次快捷键结束语音输入并切回原来的输入法。
 
 当前默认快捷键是 `Command + \`。你也可以在 Keyboard Maestro 里改成自己习惯的组合。
+
+## 适合什么场景
+
+- 平时用双拼、系统拼音或其他输入法打字
+- 需要临时按一个快捷键切到豆包语音输入
+- 语音结束后希望自动回到原来的输入法
+- 不想手动点输入法菜单或反复切换系统输入源
+
+## 仓库内容
+
+```text
+.
+├── src/DoubaoVoiceToggle.swift
+├── install.sh
+└── keyboard-maestro/DoubaoVoiceToggle-CmdBackslash.kmmacros
+```
 
 ## 当前逻辑
 
@@ -121,4 +141,3 @@ private let doubaoVoiceStartDelay: useconds_t = 300_000
 ```
 
 如果偶发切到豆包但语音框没出来，可以把它调大，例如 `500_000` 表示 `0.5` 秒。
-

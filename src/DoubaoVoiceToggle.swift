@@ -8,7 +8,13 @@ private let doubaoSourceID = "com.bytedance.inputmethod.doubaoime.pinyin"
 private let fallbackSourceID = "com.apple.inputmethod.SCIM.Shuangpin"
 private let rightCommandKeyCode: Int64 = 54
 private let rightOptionKeyCode: Int64 = 61
-private let doubaoVoiceStartDelay: useconds_t = 300_000
+private let doubaoVoiceStartDelay: TimeInterval = 0.3
+private let doubaoInputSourceReadyTimeout: TimeInterval = 1.0
+private let doubaoVoicePanelCheckTimeout: TimeInterval = 0.8
+private let doubaoVoicePanelRetryDelay: TimeInterval = 0.15
+private let doubaoVoiceShortcutMaxAttempts = 2
+private let doubaoVoiceStartShortcutHold: useconds_t = 450_000
+private let doubaoVoiceStopShortcutHold: useconds_t = 250_000
 
 // Device-specific flag bits are required because Doubao distinguishes the
 // left and right modifier keys when matching its voice shortcut.
@@ -93,6 +99,10 @@ private func withFileLock(_ name: String, _ body: () throws -> Void) throws {
     try body()
 }
 
+private func elapsedSeconds(since start: Date) -> String {
+    String(format: "%.3f", Date().timeIntervalSince(start))
+}
+
 private func stringProperty(_ source: TISInputSource, _ key: CFString) -> String? {
     guard let pointer = TISGetInputSourceProperty(source, key) else { return nil }
     return Unmanaged<CFString>.fromOpaque(pointer).takeUnretainedValue() as String
@@ -126,6 +136,26 @@ private func selectSource(id: String) -> Bool {
         if TISSelectInputSource(source) == noErr { return true }
     }
     return false
+}
+
+@discardableResult
+private func waitForInputSource(
+    matching predicate: (String) -> Bool,
+    timeout: TimeInterval,
+    pollInterval: useconds_t = 20_000
+) -> String? {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if let sourceID = currentSourceID(), predicate(sourceID) {
+            return sourceID
+        }
+        usleep(pollInterval)
+    }
+
+    if let sourceID = currentSourceID(), predicate(sourceID) {
+        return sourceID
+    }
+    return nil
 }
 
 private func commandOutput(_ executable: String, _ arguments: [String]) -> String? {
@@ -249,7 +279,7 @@ private func postModifier(keyCode: Int64, flags: CGEventFlags) throws {
     event.post(tap: .cghidEventTap)
 }
 
-private func tapDoubaoVoiceShortcut() throws {
+private func tapDoubaoVoiceShortcut(holdDuration: useconds_t) throws {
     guard CGPreflightPostEventAccess() else {
         throw NSError(domain: "DoubaoVoiceToggle", code: 11,
                       userInfo: [NSLocalizedDescriptionKey: "辅助功能尚未允许后台助手模拟按键"])
@@ -265,10 +295,110 @@ private func tapDoubaoVoiceShortcut() throws {
     try postModifier(keyCode: rightOptionKeyCode, flags: commandAndOption)
     // A very short modifier tap is occasionally ignored by Doubao. Holding
     // the captured shortcut briefly matches a normal physical key press.
-    usleep(250_000)
+    usleep(holdDuration)
     try postModifier(keyCode: rightOptionKeyCode, flags: commandOnly)
     usleep(70_000)
     try postModifier(keyCode: rightCommandKeyCode, flags: [])
+}
+
+private struct WindowInfo {
+    let ownerName: String
+    let windowName: String
+    let layer: Int
+    let alpha: Double
+    let x: Int
+    let y: Int
+    let width: Int
+    let height: Int
+
+    var isVisibleCandidate: Bool {
+        alpha > 0.05 && width >= 80 && height >= 20
+    }
+
+    var isVoicePanelCandidate: Bool {
+        layer == 3 && alpha > 0.05 && width >= 90 && width <= 180 && height >= 24 && height <= 48
+    }
+
+    var summary: String {
+        let namePart = windowName.isEmpty ? "" : " name=\(windowName)"
+        return "\(ownerName)\(namePart) layer=\(layer) alpha=\(String(format: "%.2f", alpha)) frame=\(x),\(y),\(width),\(height)"
+    }
+}
+
+private func doubaoInputMethodWindows() -> [WindowInfo] {
+    guard let windows = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] else {
+        return []
+    }
+
+    return windows.compactMap { window -> WindowInfo? in
+        let ownerName = window[kCGWindowOwnerName as String] as? String ?? ""
+        let lowerOwner = ownerName.lowercased()
+        guard ownerName.contains("豆包输入法") || lowerOwner.contains("doubaoime") else {
+            return nil
+        }
+
+        let bounds = window[kCGWindowBounds as String] as? [String: Any] ?? [:]
+        return WindowInfo(
+            ownerName: ownerName,
+            windowName: window[kCGWindowName as String] as? String ?? "",
+            layer: window[kCGWindowLayer as String] as? Int ?? 0,
+            alpha: window[kCGWindowAlpha as String] as? Double ?? 0,
+            x: bounds["X"] as? Int ?? 0,
+            y: bounds["Y"] as? Int ?? 0,
+            width: bounds["Width"] as? Int ?? 0,
+            height: bounds["Height"] as? Int ?? 0
+        )
+    }
+}
+
+private func doubaoVoicePanelVisible() -> Bool {
+    doubaoInputMethodWindows().contains { $0.isVoicePanelCandidate }
+}
+
+private func logDoubaoVoicePanelSnapshot(label: String) {
+    let windows = doubaoInputMethodWindows()
+    let visibleWindows = windows.filter { $0.isVisibleCandidate }
+    let voicePanelWindows = windows.filter { $0.isVoicePanelCandidate }
+    let summary = windows.map { $0.summary }.joined(separator: " | ")
+    log("voice panel \(label); voicePanelCandidates=\(voicePanelWindows.count); visibleCandidates=\(visibleWindows.count); windows=\(summary.isEmpty ? "none" : summary)")
+}
+
+@discardableResult
+private func waitForDoubaoVoicePanel(timeout: TimeInterval) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if doubaoVoicePanelVisible() {
+            return true
+        }
+        usleep(80_000)
+    }
+    return doubaoVoicePanelVisible()
+}
+
+private func startDoubaoVoiceWithVerification() throws -> Bool {
+    for attempt in 1...doubaoVoiceShortcutMaxAttempts {
+        if attempt > 1 {
+            log("voice panel missing; retrying voice shortcut; attempt=\(attempt)")
+        }
+
+        try tapDoubaoVoiceShortcut(holdDuration: doubaoVoiceStartShortcutHold)
+        let visible = waitForDoubaoVoicePanel(timeout: doubaoVoicePanelCheckTimeout)
+        logDoubaoVoicePanelSnapshot(
+            label: visible
+            ? "visible after voice shortcut attempt=\(attempt)"
+            : "missing after voice shortcut attempt=\(attempt)"
+        )
+
+        if visible {
+            return true
+        }
+
+        if attempt < doubaoVoiceShortcutMaxAttempts {
+            usleep(useconds_t(doubaoVoicePanelRetryDelay * 1_000_000))
+        }
+    }
+
+    return false
 }
 
 private struct FocusedTextTarget {
@@ -664,7 +794,7 @@ private func toggle() throws {
         log("stop requested; current=\(current); restore=\(previous)")
         var voiceStopSent = false
         do {
-            try tapDoubaoVoiceShortcut()
+            try tapDoubaoVoiceShortcut(holdDuration: doubaoVoiceStopShortcutHold)
             voiceStopSent = true
             requestRecorderStop()
             guard selectSource(id: previous) else {
@@ -698,9 +828,28 @@ private func toggle() throws {
             throw NSError(domain: "DoubaoVoiceToggle", code: 2,
                           userInfo: [NSLocalizedDescriptionKey: "无法切换到豆包输入法"])
         }
-        usleep(doubaoVoiceStartDelay)
-        log("start delay elapsed: 0.3s")
-        try tapDoubaoVoiceShortcut()
+
+        let switchStart = Date()
+        let readySource = waitForInputSource(
+            matching: isDoubaoSourceID,
+            timeout: doubaoInputSourceReadyTimeout
+        )
+        let elapsed = Date().timeIntervalSince(switchStart)
+        if let readySource {
+            log("input source ready; source=\(readySource); elapsed=\(elapsedSeconds(since: switchStart))s")
+        } else {
+            log("input source ready timeout; current=\(currentSourceID() ?? "unknown"); elapsed=\(elapsedSeconds(since: switchStart))s")
+        }
+
+        if elapsed < doubaoVoiceStartDelay {
+            usleep(useconds_t((doubaoVoiceStartDelay - elapsed) * 1_000_000))
+        }
+        log("start delay elapsed: \(String(format: "%.1f", doubaoVoiceStartDelay))s")
+        logDoubaoVoicePanelSnapshot(label: "before voice shortcut")
+        let panelVisible = try startDoubaoVoiceWithVerification()
+        if !panelVisible {
+            log("voice panel still missing after retries; input source remains \(currentSourceID() ?? "unknown")")
+        }
         log("started; restore=\(previous)")
         print("started\t\(previous)")
     } catch {
@@ -731,6 +880,13 @@ do {
     case "media-resume":
         resumeMediaIfPausedForVoiceSession()
         print("resume-requested")
+    case "voice-windows":
+        let windows = doubaoInputMethodWindows()
+        print("voicePanelCandidates=\(windows.filter { $0.isVoicePanelCandidate }.count)")
+        print("visibleCandidates=\(windows.filter { $0.isVisibleCandidate }.count)")
+        for window in windows {
+            print(window.summary)
+        }
     case "reset":
         try? FileManager.default.removeItem(at: stateFile)
         try? FileManager.default.removeItem(at: mediaRestoreFile)
@@ -739,7 +895,9 @@ do {
         guard CommandLine.arguments.count >= 3 else { exit(64) }
         exit(selectSource(id: CommandLine.arguments[2]) ? 0 : 1)
     default:
-        try toggle()
+        try withFileLock("toggle.lock") {
+            try toggle()
+        }
     }
 } catch {
     log("error: \(error.localizedDescription)")

@@ -10,9 +10,9 @@ private let rightCommandKeyCode: Int64 = 54
 private let rightOptionKeyCode: Int64 = 61
 private let doubaoVoiceStartDelay: TimeInterval = 0.3
 private let doubaoInputSourceReadyTimeout: TimeInterval = 1.0
-private let doubaoVoicePanelCheckTimeout: TimeInterval = 0.8
-private let doubaoVoicePanelRetryDelay: TimeInterval = 0.15
-private let doubaoVoiceShortcutMaxAttempts = 2
+private let doubaoVoicePanelCheckTimeout: TimeInterval = 0.5
+private let doubaoVoicePanelRetryDelay: TimeInterval = 0.1
+private let doubaoVoiceShortcutMaxAttempts = 5
 private let doubaoVoiceStartShortcutHold: useconds_t = 450_000
 private let doubaoVoiceStopShortcutHold: useconds_t = 250_000
 
@@ -29,8 +29,10 @@ private let supportDirectory: URL = {
 private let stateFile = supportDirectory.appendingPathComponent("previous-input-source")
 private let lastSourceFile = supportDirectory.appendingPathComponent("last-non-doubao-input-source")
 private let logFile = supportDirectory.appendingPathComponent("doubao-voice-toggle.log")
+private let maxLogFileBytes: UInt64 = 512 * 1024
 private let activeRecordSessionFile = supportDirectory.appendingPathComponent("active-record-session")
 private let mediaRestoreFile = supportDirectory.appendingPathComponent("media-restore-after-stop")
+private let cancelStartFile = supportDirectory.appendingPathComponent("cancel-start")
 private let historyFile = FileManager.default
     .urls(for: .desktopDirectory, in: .userDomainMask)[0]
     .appendingPathComponent("豆包语音输入记录.md")
@@ -105,10 +107,23 @@ private func combinedFlags(_ values: CGEventFlags...) -> CGEventFlags {
     CGEventFlags(rawValue: values.reduce(UInt64(0)) { $0 | $1.rawValue })
 }
 
+private func rotateLogIfNeeded() {
+    guard
+        let attributes = try? FileManager.default.attributesOfItem(atPath: logFile.path),
+        let size = attributes[.size] as? NSNumber,
+        size.uint64Value > maxLogFileBytes
+    else {
+        return
+    }
+    try? FileManager.default.removeItem(at: logFile)
+}
+
 private func log(_ message: String) {
     let formatter = ISO8601DateFormatter()
     let line = "\(formatter.string(from: Date())) \(message)\n"
     guard let data = line.data(using: .utf8) else { return }
+    try? FileManager.default.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
+    rotateLogIfNeeded()
     if !FileManager.default.fileExists(atPath: logFile.path) {
         try? data.write(to: logFile, options: .atomic)
         return
@@ -155,8 +170,29 @@ private func withFileLock(_ name: String, _ body: () throws -> Void) throws {
     try body()
 }
 
-private func elapsedSeconds(since start: Date) -> String {
-    String(format: "%.3f", Date().timeIntervalSince(start))
+private func withToggleLock(_ body: () throws -> Void) throws {
+    try? FileManager.default.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
+    let lockFile = supportDirectory.appendingPathComponent("toggle.lock")
+    let fd = open(lockFile.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+    guard fd >= 0 else {
+        log("toggle lock open failed; running without lock; errno=\(errno)")
+        try body()
+        return
+    }
+
+    guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+        close(fd)
+        try? "cancel".write(to: cancelStartFile, atomically: true, encoding: .utf8)
+        log("toggle lock busy; cancel requested instead of waiting; cancelFile=\(cancelStartFile.path); errno=\(errno)")
+        print("busy-cancel-requested")
+        return
+    }
+
+    defer {
+        flock(fd, LOCK_UN)
+        close(fd)
+    }
+    try body()
 }
 
 private func stringProperty(_ source: TISInputSource, _ key: CFString) -> String? {
@@ -220,7 +256,9 @@ private func commandOutput(_ executable: String, _ arguments: [String]) -> Strin
     process.executableURL = URL(fileURLWithPath: executable)
     process.arguments = arguments
     process.standardOutput = pipe
-    process.standardError = FileHandle(forWritingAtPath: "/dev/null")
+    if let nullOutput = FileHandle(forWritingAtPath: "/dev/null") {
+        process.standardError = nullOutput
+    }
 
     do {
         try process.run()
@@ -260,17 +298,14 @@ private func systemNowPlayingPlaybackRate(after command: Int32? = nil) -> Double
 
 private func systemNowPlayingIsPlaying() -> Bool? {
     if let playbackRate = systemNowPlayingPlaybackRate() {
-        log("media status; source=playback-rate; rate=\(playbackRate)")
         return playbackRate > 0
     }
 
     return nil
 }
 
-private func sendSystemMediaCommand(_ command: Int32, label: String) -> Bool {
+private func sendSystemMediaCommand(_ command: Int32) -> Bool {
     let rate = systemNowPlayingPlaybackRate(after: command)
-    let rateText = rate.map { String($0) } ?? "unknown"
-    log("media command sent; command=\(label); resultingRate=\(rateText)")
     return rate != nil
 }
 
@@ -286,25 +321,23 @@ private func pauseMediaIfPlayingForVoiceSession() -> Bool {
         log("media pause skipped; system now playing was idle")
         return false
     }
-    guard sendSystemMediaCommand(mediaRemotePauseCommand, label: "pause") else {
+    guard sendSystemMediaCommand(mediaRemotePauseCommand) else {
         return false
     }
     usleep(120_000)
 
     do {
         try mediaWasPlayingMarker.write(to: mediaRestoreFile, atomically: true, encoding: .utf8)
-        log("media paused for voice session; source=system-now-playing")
         return true
     } catch {
         log("media marker write failed: \(error.localizedDescription)")
-        _ = sendSystemMediaCommand(mediaRemotePlayCommand, label: "play-after-marker-failure")
+        _ = sendSystemMediaCommand(mediaRemotePlayCommand)
         return false
     }
 }
 
 private func resumeMediaIfPausedForVoiceSession() {
     guard let markerText = readTrimmed(mediaRestoreFile), !markerText.isEmpty else {
-        log("media resume skipped; no paused media marker")
         return
     }
 
@@ -313,13 +346,10 @@ private func resumeMediaIfPausedForVoiceSession() {
     }
 
     guard markerText == mediaWasPlayingMarker else {
-        log("media resume skipped; unknown marker=\(markerText)")
         return
     }
 
-    if sendSystemMediaCommand(mediaRemotePlayCommand, label: "play") {
-        log("media resumed after voice session; source=system-now-playing")
-    }
+    _ = sendSystemMediaCommand(mediaRemotePlayCommand)
 }
 
 private func postModifier(keyCode: Int64, flags: CGEventFlags) throws {
@@ -345,13 +375,11 @@ private func tapDoubaoVoiceShortcut(holdDuration: useconds_t) throws {
     )
 
     try postModifier(keyCode: rightCommandKeyCode, flags: commandOnly)
-    usleep(70_000)
     try postModifier(keyCode: rightOptionKeyCode, flags: commandAndOption)
     // A very short modifier tap is occasionally ignored by Doubao. Holding
     // the captured shortcut briefly matches a normal physical key press.
     usleep(holdDuration)
     try postModifier(keyCode: rightOptionKeyCode, flags: commandOnly)
-    usleep(70_000)
     try postModifier(keyCode: rightCommandKeyCode, flags: [])
 }
 
@@ -409,14 +437,6 @@ private func doubaoVoicePanelVisible() -> Bool {
     doubaoInputMethodWindows().contains { $0.isVoicePanelCandidate }
 }
 
-private func logDoubaoVoicePanelSnapshot(label: String) {
-    let windows = doubaoInputMethodWindows()
-    let visibleWindows = windows.filter { $0.isVisibleCandidate }
-    let voicePanelWindows = windows.filter { $0.isVoicePanelCandidate }
-    let summary = windows.map { $0.summary }.joined(separator: " | ")
-    log("voice panel \(label); voicePanelCandidates=\(voicePanelWindows.count); visibleCandidates=\(visibleWindows.count); windows=\(summary.isEmpty ? "none" : summary)")
-}
-
 @discardableResult
 private func waitForDoubaoVoicePanel(timeout: TimeInterval) -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
@@ -429,29 +449,55 @@ private func waitForDoubaoVoicePanel(timeout: TimeInterval) -> Bool {
     return doubaoVoicePanelVisible()
 }
 
+@discardableResult
+private func waitBeforeNextDoubaoVoiceRetry(timeout: TimeInterval) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if FileManager.default.fileExists(atPath: cancelStartFile.path) {
+            return false
+        }
+        if doubaoVoicePanelVisible() {
+            return true
+        }
+        if let sourceID = currentSourceID(), !isDoubaoSourceID(sourceID) {
+            return false
+        }
+        usleep(100_000)
+    }
+    return doubaoVoicePanelVisible()
+}
+
 private func startDoubaoVoiceWithVerification() throws -> Bool {
     for attempt in 1...doubaoVoiceShortcutMaxAttempts {
+        if FileManager.default.fileExists(atPath: cancelStartFile.path) {
+            return false
+        }
+        if attempt > 1, doubaoVoicePanelVisible() {
+            return true
+        }
+        if let sourceID = currentSourceID(), !isDoubaoSourceID(sourceID) {
+            return false
+        }
+
         if attempt > 1 {
-            log("voice panel missing; retrying voice shortcut; attempt=\(attempt)")
+            log("voice panel missing; retrying internal shortcut; attempt=\(attempt)")
         }
 
         try tapDoubaoVoiceShortcut(holdDuration: doubaoVoiceStartShortcutHold)
         let visible = waitForDoubaoVoicePanel(timeout: doubaoVoicePanelCheckTimeout)
-        logDoubaoVoicePanelSnapshot(
-            label: visible
-            ? "visible after voice shortcut attempt=\(attempt)"
-            : "missing after voice shortcut attempt=\(attempt)"
-        )
 
         if visible {
             return true
         }
 
         if attempt < doubaoVoiceShortcutMaxAttempts {
-            usleep(useconds_t(doubaoVoicePanelRetryDelay * 1_000_000))
+            if waitBeforeNextDoubaoVoiceRetry(timeout: doubaoVoicePanelRetryDelay) {
+                return true
+            }
         }
     }
 
+    log("voice start verification failed after all attempts")
     return false
 }
 
@@ -485,6 +531,7 @@ private func focusedTextTarget() -> FocusedTextTarget? {
     guard AXUIElementCopyAttributeValue(appElement, kAXFocusedUIElementAttribute as CFString, &focused) == .success else {
         return nil
     }
+    guard CFGetTypeID(focused) == AXUIElementGetTypeID() else { return nil }
     let element = focused as! AXUIElement
     guard isEditableTextElement(element) else { return nil }
     return FocusedTextTarget(
@@ -759,9 +806,13 @@ private func startRecorder() {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: executablePath())
     process.arguments = ["record", sessionID]
-    process.standardOutput = FileHandle(forWritingAtPath: "/dev/null")
-    process.standardError = FileHandle(forWritingAtPath: "/dev/null")
-    process.standardInput = FileHandle(forReadingAtPath: "/dev/null")
+    if let nullOutput = FileHandle(forWritingAtPath: "/dev/null") {
+        process.standardOutput = nullOutput
+        process.standardError = nullOutput
+    }
+    if let nullInput = FileHandle(forReadingAtPath: "/dev/null") {
+        process.standardInput = nullInput
+    }
 
     do {
         try process.run()
@@ -837,6 +888,7 @@ private func listSources() {
 private func toggle() throws {
     let fm = FileManager.default
     try fm.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
+    try? fm.removeItem(at: cancelStartFile)
 
     guard let current = currentSourceID() else {
         throw NSError(domain: "DoubaoVoiceToggle", code: 1,
@@ -851,7 +903,8 @@ private func toggle() throws {
             try tapDoubaoVoiceShortcut(holdDuration: doubaoVoiceStopShortcutHold)
             voiceStopSent = true
             requestRecorderStop()
-            guard selectSource(id: previous) else {
+            let restored = selectSource(id: previous)
+            guard restored else {
                 throw NSError(domain: "DoubaoVoiceToggle", code: 12,
                               userInfo: [NSLocalizedDescriptionKey: "无法恢复原输入法"])
             }
@@ -863,7 +916,7 @@ private func toggle() throws {
             if voiceStopSent {
                 resumeMediaIfPausedForVoiceSession()
             }
-            log("stop failed: \(error.localizedDescription)")
+            log("stop failed: \(error.localizedDescription); current=\(currentSourceID() ?? "unknown")")
             throw error
         }
         return
@@ -878,31 +931,27 @@ private func toggle() throws {
     do {
         pauseMediaIfPlayingForVoiceSession()
         startRecorder()
-        guard selectSource(id: doubaoSourceID) else {
+        let selectedDoubao = selectSource(id: doubaoSourceID)
+        guard selectedDoubao else {
             throw NSError(domain: "DoubaoVoiceToggle", code: 2,
                           userInfo: [NSLocalizedDescriptionKey: "无法切换到豆包输入法"])
         }
 
         let switchStart = Date()
-        let readySource = waitForInputSource(
+        _ = waitForInputSource(
             matching: isDoubaoSourceID,
             timeout: doubaoInputSourceReadyTimeout
         )
         let elapsed = Date().timeIntervalSince(switchStart)
-        if let readySource {
-            log("input source ready; source=\(readySource); elapsed=\(elapsedSeconds(since: switchStart))s")
-        } else {
-            log("input source ready timeout; current=\(currentSourceID() ?? "unknown"); elapsed=\(elapsedSeconds(since: switchStart))s")
-        }
 
         if elapsed < doubaoVoiceStartDelay {
             usleep(useconds_t((doubaoVoiceStartDelay - elapsed) * 1_000_000))
         }
-        log("start delay elapsed: \(String(format: "%.1f", doubaoVoiceStartDelay))s")
-        logDoubaoVoicePanelSnapshot(label: "before voice shortcut")
         let panelVisible = try startDoubaoVoiceWithVerification()
         if !panelVisible {
             log("voice panel still missing after retries; input source remains \(currentSourceID() ?? "unknown")")
+            throw NSError(domain: "DoubaoVoiceToggle", code: 15,
+                          userInfo: [NSLocalizedDescriptionKey: "豆包语音输入框未出现"])
         }
         log("started; restore=\(previous)")
         print("started\t\(previous)")
@@ -911,6 +960,7 @@ private func toggle() throws {
         resumeMediaIfPausedForVoiceSession()
         _ = selectSource(id: previous)
         try? fm.removeItem(at: stateFile)
+        try? fm.removeItem(at: cancelStartFile)
         log("start failed: \(error.localizedDescription)")
         throw error
     }
@@ -948,12 +998,13 @@ do {
     case "reset":
         try? FileManager.default.removeItem(at: stateFile)
         try? FileManager.default.removeItem(at: mediaRestoreFile)
+        try? FileManager.default.removeItem(at: cancelStartFile)
         print("reset")
     case "select":
         guard CommandLine.arguments.count >= 3 else { exit(64) }
         exit(selectSource(id: CommandLine.arguments[2]) ? 0 : 1)
     default:
-        try withFileLock("toggle.lock") {
+        try withToggleLock {
             try toggle()
         }
     }

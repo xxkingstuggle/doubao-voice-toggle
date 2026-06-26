@@ -24,6 +24,7 @@ private let stateFile = supportDirectory.appendingPathComponent("previous-input-
 private let lastSourceFile = supportDirectory.appendingPathComponent("last-non-doubao-input-source")
 private let logFile = supportDirectory.appendingPathComponent("doubao-voice-toggle.log")
 private let activeRecordSessionFile = supportDirectory.appendingPathComponent("active-record-session")
+private let mediaRestoreFile = supportDirectory.appendingPathComponent("media-restore-after-stop")
 private let historyFile = FileManager.default
     .urls(for: .desktopDirectory, in: .userDomainMask)[0]
     .appendingPathComponent("豆包语音输入记录.md")
@@ -36,6 +37,7 @@ private let recorderSupersededGraceWait: TimeInterval = 0.4
 private let recorderMaxSessionDuration: TimeInterval = 900.0
 private let previousRecorderSettleWait: TimeInterval = 1.0
 private let historyTitle = "# 豆包语音输入记录"
+private let nxKeyTypePlay: Int = 16
 
 private func combinedFlags(_ values: CGEventFlags...) -> CGEventFlags {
     CGEventFlags(rawValue: values.reduce(UInt64(0)) { $0 | $1.rawValue })
@@ -124,6 +126,116 @@ private func selectSource(id: String) -> Bool {
         if TISSelectInputSource(source) == noErr { return true }
     }
     return false
+}
+
+private func commandOutput(_ executable: String, _ arguments: [String]) -> String? {
+    let process = Process()
+    let pipe = Pipe()
+    process.executableURL = URL(fileURLWithPath: executable)
+    process.arguments = arguments
+    process.standardOutput = pipe
+    process.standardError = FileHandle(forWritingAtPath: "/dev/null")
+
+    do {
+        try process.run()
+        process.waitUntilExit()
+    } catch {
+        return nil
+    }
+
+    guard process.terminationStatus == 0 else { return nil }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    return String(data: data, encoding: .utf8)
+}
+
+private func systemAudioPlaybackActive() -> Bool {
+    guard let output = commandOutput("/usr/bin/pmset", ["-g", "assertions"]) else {
+        log("media status unavailable; pmset failed")
+        return false
+    }
+
+    for line in output.split(separator: "\n") {
+        let lower = line.lowercased()
+        guard lower.contains("pid "),
+              lower.contains("preventuseridlesystemsleep") else {
+            continue
+        }
+        if lower.contains("audio") || lower.contains("coreaudiod") {
+            return true
+        }
+    }
+
+    return false
+}
+
+private func postMediaPlayPauseKey() throws {
+    guard CGPreflightPostEventAccess() else {
+        throw NSError(domain: "DoubaoVoiceToggle", code: 13,
+                      userInfo: [NSLocalizedDescriptionKey: "辅助功能尚未允许后台助手控制媒体播放"])
+    }
+
+    func post(down: Bool) throws {
+        let modifierValue = UInt(down ? 0xA00 : 0xB00)
+        let keyState = down ? 0xA : 0xB
+        let data1 = (nxKeyTypePlay << 16) | (keyState << 8)
+        guard let event = NSEvent.otherEvent(
+            with: .systemDefined,
+            location: .zero,
+            modifierFlags: NSEvent.ModifierFlags(rawValue: modifierValue),
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            subtype: 8,
+            data1: data1,
+            data2: -1
+        )?.cgEvent else {
+            throw NSError(domain: "DoubaoVoiceToggle", code: 14,
+                          userInfo: [NSLocalizedDescriptionKey: "无法创建媒体控制事件"])
+        }
+        event.post(tap: CGEventTapLocation.cghidEventTap)
+    }
+
+    try post(down: true)
+    usleep(40_000)
+    try post(down: false)
+}
+
+@discardableResult
+private func pauseMediaIfPlayingForVoiceSession() -> Bool {
+    try? FileManager.default.removeItem(at: mediaRestoreFile)
+
+    guard systemAudioPlaybackActive() else {
+        log("media pause skipped; no active audio playback")
+        return false
+    }
+
+    do {
+        try postMediaPlayPauseKey()
+        try "media-key".write(to: mediaRestoreFile, atomically: true, encoding: .utf8)
+        log("media paused for voice session")
+        return true
+    } catch {
+        log("media pause failed: \(error.localizedDescription)")
+        return false
+    }
+}
+
+private func resumeMediaIfPausedForVoiceSession() {
+    guard FileManager.default.fileExists(atPath: mediaRestoreFile.path) else {
+        log("media resume skipped; no paused media marker")
+        return
+    }
+
+    defer {
+        try? FileManager.default.removeItem(at: mediaRestoreFile)
+    }
+
+    do {
+        try postMediaPlayPauseKey()
+        log("media resumed after voice session")
+    } catch {
+        log("media resume failed: \(error.localizedDescription)")
+    }
 }
 
 private func postModifier(keyCode: Int64, flags: CGEventFlags) throws {
@@ -550,17 +662,23 @@ private func toggle() throws {
     if isDoubaoSourceID(current) {
         let previous = restoreSourceID()
         log("stop requested; current=\(current); restore=\(previous)")
+        var voiceStopSent = false
         do {
             try tapDoubaoVoiceShortcut()
+            voiceStopSent = true
             requestRecorderStop()
             guard selectSource(id: previous) else {
                 throw NSError(domain: "DoubaoVoiceToggle", code: 12,
                               userInfo: [NSLocalizedDescriptionKey: "无法恢复原输入法"])
             }
+            resumeMediaIfPausedForVoiceSession()
             try? fm.removeItem(at: stateFile)
             log("stopped; restored=\(previous)")
             print("stopped\t\(previous)")
         } catch {
+            if voiceStopSent {
+                resumeMediaIfPausedForVoiceSession()
+            }
             log("stop failed: \(error.localizedDescription)")
             throw error
         }
@@ -574,6 +692,7 @@ private func toggle() throws {
     log("start requested; current=\(current); restore=\(previous)")
 
     do {
+        pauseMediaIfPlayingForVoiceSession()
         startRecorder()
         guard selectSource(id: doubaoSourceID) else {
             throw NSError(domain: "DoubaoVoiceToggle", code: 2,
@@ -586,6 +705,7 @@ private func toggle() throws {
         print("started\t\(previous)")
     } catch {
         requestRecorderStop()
+        resumeMediaIfPausedForVoiceSession()
         _ = selectSource(id: previous)
         try? fm.removeItem(at: stateFile)
         log("start failed: \(error.localizedDescription)")
@@ -604,8 +724,16 @@ do {
         print(currentSourceID() ?? "")
     case "access":
         print(CGPreflightPostEventAccess() ? "granted" : "denied")
+    case "media-status":
+        print(systemAudioPlaybackActive() ? "playing" : "idle")
+    case "media-pause":
+        print(pauseMediaIfPlayingForVoiceSession() ? "paused" : "idle")
+    case "media-resume":
+        resumeMediaIfPausedForVoiceSession()
+        print("resume-requested")
     case "reset":
         try? FileManager.default.removeItem(at: stateFile)
+        try? FileManager.default.removeItem(at: mediaRestoreFile)
         print("reset")
     case "select":
         guard CommandLine.arguments.count >= 3 else { exit(64) }

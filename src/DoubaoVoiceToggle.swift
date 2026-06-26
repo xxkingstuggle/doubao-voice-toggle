@@ -43,7 +43,63 @@ private let recorderSupersededGraceWait: TimeInterval = 0.4
 private let recorderMaxSessionDuration: TimeInterval = 900.0
 private let previousRecorderSettleWait: TimeInterval = 1.0
 private let historyTitle = "# 豆包语音输入记录"
-private let nxKeyTypePlay: Int = 16
+private let mediaWasPlayingMarker = "system-now-playing-was-playing"
+private let mediaRemoteFrameworkPath = "/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote"
+private let mediaRemotePlaybackRateKey = "kMRMediaRemoteNowPlayingInfoPlaybackRate"
+private let mediaRemotePlayCommand: Int32 = 0
+private let mediaRemotePauseCommand: Int32 = 1
+
+private func mediaRemotePlaybackProbeScript(command: Int32? = nil) -> String {
+    let commandExpression = command.map { "Int32(\($0))" } ?? "nil"
+    return """
+import Foundation
+import Dispatch
+import Darwin
+
+typealias GetInfo = @convention(c) (DispatchQueue, @escaping @convention(block) (CFDictionary?) -> Void) -> Void
+typealias SendCommand = @convention(c) (Int32, CFDictionary?) -> DarwinBoolean
+
+guard let handle = dlopen("\(mediaRemoteFrameworkPath)", RTLD_LAZY),
+      let symbol = dlsym(handle, "MRMediaRemoteGetNowPlayingInfo") else {
+    print("unknown")
+    exit(0)
+}
+
+let getInfo = unsafeBitCast(symbol, to: GetInfo.self)
+let commandToSend: Int32? = \(commandExpression)
+if let commandToSend, let sendSymbol = dlsym(handle, "MRMediaRemoteSendCommand") {
+    let send = unsafeBitCast(sendSymbol, to: SendCommand.self)
+    _ = send(commandToSend, nil)
+    usleep(120_000)
+}
+
+let semaphore = DispatchSemaphore(value: 0)
+var output = "unknown"
+
+getInfo(DispatchQueue.global(qos: .userInitiated)) { info in
+    if let info {
+        let dictionary = info as NSDictionary
+        let value = dictionary.object(forKey: "\(mediaRemotePlaybackRateKey)")
+        if let number = value as? NSNumber {
+            output = String(number.doubleValue)
+        } else if let double = value as? Double {
+            output = String(double)
+        } else if let int = value as? Int {
+            output = String(Double(int))
+        } else if let float = value as? Float {
+            output = String(Double(float))
+        }
+    }
+    semaphore.signal()
+}
+
+if semaphore.wait(timeout: .now() + 2) == .success {
+    print(output)
+} else {
+    print("unknown")
+}
+"""
+}
 
 private func combinedFlags(_ values: CGEventFlags...) -> CGEventFlags {
     CGEventFlags(rawValue: values.reduce(UInt64(0)) { $0 | $1.rawValue })
@@ -175,83 +231,79 @@ private func commandOutput(_ executable: String, _ arguments: [String]) -> Strin
 
     guard process.terminationStatus == 0 else { return nil }
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
-    return String(data: data, encoding: .utf8)
+    return String(data: data, encoding: .utf8)?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
-private func systemAudioPlaybackActive() -> Bool {
-    guard let output = commandOutput("/usr/bin/pmset", ["-g", "assertions"]) else {
-        log("media status unavailable; pmset failed")
-        return false
-    }
+private func systemNowPlayingPlaybackRate(after command: Int32? = nil) -> Double? {
+    let script = mediaRemotePlaybackProbeScript(command: command)
+    let candidates = [
+        ("/usr/bin/swift", ["-e", script]),
+        ("/usr/bin/xcrun", ["swift", "-e", script])
+    ]
 
-    for line in output.split(separator: "\n") {
-        let lower = line.lowercased()
-        guard lower.contains("pid "),
-              lower.contains("preventuseridlesystemsleep") else {
+    for candidate in candidates {
+        guard let output = commandOutput(candidate.0, candidate.1), !output.isEmpty else {
             continue
         }
-        if lower.contains("audio") || lower.contains("coreaudiod") {
-            return true
+        if output == "unknown" {
+            continue
         }
+        if let rate = Double(output) {
+            return rate
+        }
+        log("media playback rate probe unreadable; output=\(output)")
     }
 
-    return false
+    return nil
 }
 
-private func postMediaPlayPauseKey() throws {
-    guard CGPreflightPostEventAccess() else {
-        throw NSError(domain: "DoubaoVoiceToggle", code: 13,
-                      userInfo: [NSLocalizedDescriptionKey: "辅助功能尚未允许后台助手控制媒体播放"])
+private func systemNowPlayingIsPlaying() -> Bool? {
+    if let playbackRate = systemNowPlayingPlaybackRate() {
+        log("media status; source=playback-rate; rate=\(playbackRate)")
+        return playbackRate > 0
     }
 
-    func post(down: Bool) throws {
-        let modifierValue = UInt(down ? 0xA00 : 0xB00)
-        let keyState = down ? 0xA : 0xB
-        let data1 = (nxKeyTypePlay << 16) | (keyState << 8)
-        guard let event = NSEvent.otherEvent(
-            with: .systemDefined,
-            location: .zero,
-            modifierFlags: NSEvent.ModifierFlags(rawValue: modifierValue),
-            timestamp: 0,
-            windowNumber: 0,
-            context: nil,
-            subtype: 8,
-            data1: data1,
-            data2: -1
-        )?.cgEvent else {
-            throw NSError(domain: "DoubaoVoiceToggle", code: 14,
-                          userInfo: [NSLocalizedDescriptionKey: "无法创建媒体控制事件"])
-        }
-        event.post(tap: CGEventTapLocation.cghidEventTap)
-    }
+    return nil
+}
 
-    try post(down: true)
-    usleep(40_000)
-    try post(down: false)
+private func sendSystemMediaCommand(_ command: Int32, label: String) -> Bool {
+    let rate = systemNowPlayingPlaybackRate(after: command)
+    let rateText = rate.map { String($0) } ?? "unknown"
+    log("media command sent; command=\(label); resultingRate=\(rateText)")
+    return rate != nil
 }
 
 @discardableResult
 private func pauseMediaIfPlayingForVoiceSession() -> Bool {
     try? FileManager.default.removeItem(at: mediaRestoreFile)
 
-    guard systemAudioPlaybackActive() else {
-        log("media pause skipped; no active audio playback")
+    guard let wasPlaying = systemNowPlayingIsPlaying() else {
+        log("media pause skipped; system now playing state unavailable")
         return false
     }
+    guard wasPlaying else {
+        log("media pause skipped; system now playing was idle")
+        return false
+    }
+    guard sendSystemMediaCommand(mediaRemotePauseCommand, label: "pause") else {
+        return false
+    }
+    usleep(120_000)
 
     do {
-        try postMediaPlayPauseKey()
-        try "media-key".write(to: mediaRestoreFile, atomically: true, encoding: .utf8)
-        log("media paused for voice session")
+        try mediaWasPlayingMarker.write(to: mediaRestoreFile, atomically: true, encoding: .utf8)
+        log("media paused for voice session; source=system-now-playing")
         return true
     } catch {
-        log("media pause failed: \(error.localizedDescription)")
+        log("media marker write failed: \(error.localizedDescription)")
+        _ = sendSystemMediaCommand(mediaRemotePlayCommand, label: "play-after-marker-failure")
         return false
     }
 }
 
 private func resumeMediaIfPausedForVoiceSession() {
-    guard FileManager.default.fileExists(atPath: mediaRestoreFile.path) else {
+    guard let markerText = readTrimmed(mediaRestoreFile), !markerText.isEmpty else {
         log("media resume skipped; no paused media marker")
         return
     }
@@ -260,11 +312,13 @@ private func resumeMediaIfPausedForVoiceSession() {
         try? FileManager.default.removeItem(at: mediaRestoreFile)
     }
 
-    do {
-        try postMediaPlayPauseKey()
-        log("media resumed after voice session")
-    } catch {
-        log("media resume failed: \(error.localizedDescription)")
+    guard markerText == mediaWasPlayingMarker else {
+        log("media resume skipped; unknown marker=\(markerText)")
+        return
+    }
+
+    if sendSystemMediaCommand(mediaRemotePlayCommand, label: "play") {
+        log("media resumed after voice session; source=system-now-playing")
     }
 }
 
@@ -874,7 +928,11 @@ do {
     case "access":
         print(CGPreflightPostEventAccess() ? "granted" : "denied")
     case "media-status":
-        print(systemAudioPlaybackActive() ? "playing" : "idle")
+        if let isPlaying = systemNowPlayingIsPlaying() {
+            print(isPlaying ? "playing" : "idle")
+        } else {
+            print("unknown")
+        }
     case "media-pause":
         print(pauseMediaIfPlayingForVoiceSession() ? "paused" : "idle")
     case "media-resume":

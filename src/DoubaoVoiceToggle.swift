@@ -28,9 +28,14 @@ private let historyFile = FileManager.default
     .urls(for: .desktopDirectory, in: .userDomainMask)[0]
     .appendingPathComponent("豆包语音输入记录.md")
 
-private let recorderQuietFinishDelay: TimeInterval = 1.0
-private let recorderMaxStopWait: TimeInterval = 3.0
+private let recorderPollInterval: TimeInterval = 0.15
+private let recorderQuietFinishDelay: TimeInterval = 0.7
+private let recorderNoChangeStopWait: TimeInterval = 2.5
+private let recorderMaxStopWait: TimeInterval = 4.0
+private let recorderSupersededGraceWait: TimeInterval = 0.4
 private let recorderMaxSessionDuration: TimeInterval = 900.0
+private let previousRecorderSettleWait: TimeInterval = 1.0
+private let historyTitle = "# 豆包语音输入记录"
 
 private func combinedFlags(_ values: CGEventFlags...) -> CGEventFlags {
     CGEventFlags(rawValue: values.reduce(UInt64(0)) { $0 | $1.rawValue })
@@ -68,6 +73,22 @@ private func recordStopFile(_ sessionID: String) -> URL {
 
 private func recordDoneFile(_ sessionID: String) -> URL {
     supportDirectory.appendingPathComponent("record-\(sessionID).done")
+}
+
+private func withFileLock(_ name: String, _ body: () throws -> Void) throws {
+    try? FileManager.default.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
+    let lockFile = supportDirectory.appendingPathComponent(name)
+    let fd = open(lockFile.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+    guard fd >= 0 else {
+        try body()
+        return
+    }
+    defer {
+        flock(fd, LOCK_UN)
+        close(fd)
+    }
+    flock(fd, LOCK_EX)
+    try body()
 }
 
 private func stringProperty(_ source: TISInputSource, _ key: CFString) -> String? {
@@ -231,6 +252,29 @@ private func insertedText(from old: String, to new: String) -> String {
     return String(chars[start..<end])
 }
 
+private func withoutLeadingNewlines(_ value: String) -> String {
+    var result = value
+    while result.hasPrefix("\n") || result.hasPrefix("\r") {
+        result.removeFirst()
+    }
+    return result
+}
+
+private func historyContentByPrepending(entry: String, existing: String) -> String {
+    let header = "\(historyTitle)\n\n"
+    guard !existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        return header + entry
+    }
+
+    if existing.hasPrefix(historyTitle) {
+        let remainderStart = existing.index(existing.startIndex, offsetBy: historyTitle.count)
+        let remainder = withoutLeadingNewlines(String(existing[remainderStart...]))
+        return header + entry + remainder
+    }
+
+    return header + entry + existing
+}
+
 private func appendHistory(text: String, target: FocusedTextTarget, finalValue: String) {
     let timestampFormatter = DateFormatter()
     timestampFormatter.locale = Locale(identifier: "zh_CN")
@@ -238,7 +282,6 @@ private func appendHistory(text: String, target: FocusedTextTarget, finalValue: 
     let timestamp = timestampFormatter.string(from: Date())
     let bundle = target.bundleIdentifier.isEmpty ? "" : "（\(target.bundleIdentifier)）"
     let entry = """
-
 ## \(timestamp)
 
 App：\(target.appName)\(bundle)
@@ -248,25 +291,29 @@ App：\(target.appName)\(bundle)
 ---
 
 """
-    guard let data = entry.data(using: .utf8) else { return }
-    if !FileManager.default.fileExists(atPath: historyFile.path) {
-        let header = "# 豆包语音输入记录\n"
-        var firstData = Data(header.utf8)
-        firstData.append(data)
-        try? firstData.write(to: historyFile, options: .atomic)
-        return
+
+    do {
+        try withFileLock("history.lock") {
+            let existing = (try? String(contentsOf: historyFile, encoding: .utf8)) ?? ""
+            let content = historyContentByPrepending(entry: entry, existing: existing)
+            try content.write(to: historyFile, atomically: true, encoding: .utf8)
+        }
+    } catch {
+        log("history write failed: \(error.localizedDescription)")
     }
-    if let handle = try? FileHandle(forWritingTo: historyFile) {
-        defer { try? handle.close() }
-        do {
-            try handle.seekToEnd()
-            try handle.write(contentsOf: data)
-        } catch {}
+}
+
+private func recorderWasSuperseded() -> Bool {
+    guard recorderStopRequestedAt != nil else { return false }
+    guard let activeSessionID = readTrimmed(activeRecordSessionFile), !activeSessionID.isEmpty else {
+        return false
     }
+    return activeSessionID != recorderSessionID
 }
 
 private func recorderUpdateLatestValue() {
     guard let target = recorderTarget else { return }
+    guard !recorderWasSuperseded() else { return }
     let current = axValue(target.element)
     guard current != recorderLatestValue else { return }
     recorderLatestValue = current
@@ -285,16 +332,20 @@ private func finishRecorder(reason: String) -> Never {
         let text = insertedText(from: recorderInitialValue, to: recorderLatestValue)
         if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             appendHistory(text: text, target: target, finalValue: recorderLatestValue)
-            log("record saved; reason=\(reason); app=\(target.appName); chars=\(text.count)")
+            log("record saved; reason=\(reason); app=\(target.appName); initialLen=\(recorderInitialValue.count); finalLen=\(recorderLatestValue.count); chars=\(text.count)")
         } else {
-            log("record skipped empty; reason=\(reason)")
+            log("record skipped empty; reason=\(reason); initialLen=\(recorderInitialValue.count); finalLen=\(recorderLatestValue.count)")
         }
     } else {
         log("record skipped no target; reason=\(reason)")
     }
 
     try? FileManager.default.removeItem(at: recordStopFile(recorderSessionID))
-    try? FileManager.default.removeItem(at: activeRecordSessionFile)
+    if readTrimmed(activeRecordSessionFile) == recorderSessionID {
+        try? FileManager.default.removeItem(at: activeRecordSessionFile)
+    } else {
+        log("record active session retained; finished=\(recorderSessionID); active=\(readTrimmed(activeRecordSessionFile) ?? "none")")
+    }
     try? "done".write(to: recordDoneFile(recorderSessionID), atomically: true, encoding: .utf8)
     exit(0)
 }
@@ -350,20 +401,38 @@ private func runRecorder(sessionID: String) -> Never {
     log("record started; session=\(sessionID); app=\(target.appName); initialLen=\(recorderInitialValue.count)")
 
     let startTime = Date()
-    Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { _ in
-        recorderUpdateLatestValue()
-
+    Timer.scheduledTimer(withTimeInterval: recorderPollInterval, repeats: true) { _ in
         if FileManager.default.fileExists(atPath: recordStopFile(sessionID).path) {
             if recorderStopRequestedAt == nil {
                 recorderStopRequestedAt = Date()
                 log("record stop requested; session=\(sessionID)")
             }
             let stopAt = recorderStopRequestedAt ?? Date()
-            let quietEnough = Date().timeIntervalSince(recorderLastChange) >= recorderQuietFinishDelay
-            let waitedEnough = Date().timeIntervalSince(stopAt) >= recorderMaxStopWait
-            if quietEnough || waitedEnough {
-                finishRecorder(reason: quietEnough ? "quiet-after-stop" : "max-stop-wait")
+            let stopElapsed = Date().timeIntervalSince(stopAt)
+            let superseded = recorderWasSuperseded()
+
+            if !superseded {
+                recorderUpdateLatestValue()
             }
+
+            let text = insertedText(from: recorderInitialValue, to: recorderLatestValue)
+            let hasText = !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            let quietEnough = Date().timeIntervalSince(recorderLastChange) >= recorderQuietFinishDelay
+
+            if hasText, quietEnough {
+                finishRecorder(reason: "quiet-after-change")
+            }
+            if stopElapsed >= recorderMaxStopWait {
+                finishRecorder(reason: "max-stop-wait")
+            }
+            if !hasText, superseded, stopElapsed >= recorderSupersededGraceWait {
+                finishRecorder(reason: "superseded-before-change")
+            }
+            if !hasText, stopElapsed >= recorderNoChangeStopWait {
+                finishRecorder(reason: "no-change-stop-wait")
+            }
+        } else {
+            recorderUpdateLatestValue()
         }
 
         if Date().timeIntervalSince(startTime) >= recorderMaxSessionDuration {
@@ -383,6 +452,8 @@ private func executablePath() -> String {
 }
 
 private func startRecorder() {
+    settlePreviousRecorderBeforeStart()
+
     let sessionID = UUID().uuidString
     try? FileManager.default.removeItem(at: recordReadyFile(sessionID))
     try? FileManager.default.removeItem(at: recordStopFile(sessionID))
@@ -412,6 +483,36 @@ private func startRecorder() {
         usleep(50_000)
     }
     log("record launch pending; session=\(sessionID)")
+}
+
+private func settlePreviousRecorderBeforeStart() {
+    guard let sessionID = readTrimmed(activeRecordSessionFile), !sessionID.isEmpty else {
+        return
+    }
+
+    if FileManager.default.fileExists(atPath: recordDoneFile(sessionID).path) {
+        if readTrimmed(activeRecordSessionFile) == sessionID {
+            try? FileManager.default.removeItem(at: activeRecordSessionFile)
+        }
+        return
+    }
+
+    log("record previous active before start; waiting; session=\(sessionID)")
+    try? "stop".write(to: recordStopFile(sessionID), atomically: true, encoding: .utf8)
+
+    let deadline = Date().addingTimeInterval(previousRecorderSettleWait)
+    while Date() < deadline {
+        if FileManager.default.fileExists(atPath: recordDoneFile(sessionID).path) {
+            if readTrimmed(activeRecordSessionFile) == sessionID {
+                try? FileManager.default.removeItem(at: activeRecordSessionFile)
+            }
+            log("record previous settled before start; session=\(sessionID)")
+            return
+        }
+        usleep(50_000)
+    }
+
+    log("record previous still finalizing; session=\(sessionID)")
 }
 
 private func requestRecorderStop() {

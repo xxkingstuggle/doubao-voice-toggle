@@ -13,6 +13,7 @@ mkdir -p "$APP_SUPPORT" "$BUILD_DIR"
 xcrun swiftc -O \
   -framework Carbon \
   -framework ApplicationServices \
+  -framework AppKit \
   "$SOURCE_FILE" \
   -o "$BUILD_TARGET"
 
@@ -20,4 +21,3 @@ codesign --force --sign - "$BUILD_TARGET" >/dev/null
 install -m 755 "$BUILD_TARGET" "$TARGET"
 
 echo "installed: $TARGET"
-

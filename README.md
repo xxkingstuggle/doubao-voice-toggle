@@ -3,47 +3,52 @@
 [![macOS](https://img.shields.io/badge/macOS-automation-111827)](https://www.apple.com/macos/)
 [![Swift](https://img.shields.io/badge/Swift-helper-orange)](https://www.swift.org/)
 [![Keyboard Maestro](https://img.shields.io/badge/Keyboard%20Maestro-supported-blue)](https://www.keyboardmaestro.com/)
+[![Status](https://img.shields.io/badge/status-personal%20daily%20tool-22c55e)](#)
 
-一个 Mac 小工具。
+一个给 Mac 用的豆包输入法语音助手。
 
 按一次快捷键：切到豆包输入法，打开语音输入。
-再按一次：结束语音输入，切回原来的输入法。
 
-顺手做三件事：
+再按一次快捷键：结束语音输入，切回原来的输入法。
 
-- 读取系统播放器状态，正在播放才暂停，结束后恢复。
-- 把豆包语音输入结果记到桌面 Markdown。
-- 新记录放最上面，不用翻到底。
+同时它会把语音输入出来的文字保存到桌面 Markdown，像一个轻量历史记录。
 
-## 它怎么工作
+## 核心功能
 
-启动时：
+- 一键切到豆包输入法并触发语音输入。
+- 再按一次，结束语音并切回原输入法。
+- 语音输入前，如果系统正在播放音乐，会先暂停。
+- 语音结束后，只在原本就是播放状态时恢复播放。
+- 自动记录本次语音写入的文字。
+- 新记录写在文件最上方，不用翻到底。
+- 内部触发豆包语音使用 `右 Command + 右 Option`，两个键同时按下，不插入额外间隔。
 
-1. 记住当前输入法。
-2. 读取系统 Now Playing 状态；如果正在播放，先暂停。
-3. 启动记录器，盯住当前输入框。
-4. 切到豆包输入法。
-5. 按豆包内部语音快捷键：`右 Command + 右 Option`，两个键同时落下，不插入间隔。
-6. 不做额外锁等待，也不再扫语音小窗；按键链路尽量短。
-
-结束时：
-
-1. 再按一次豆包内部语音快捷键，结束语音。
-2. 立刻切回原输入法。
-3. 如果启动前系统播放器是播放中，就恢复播放。
-4. 把新增文字写进桌面记录。
-
-媒体控制走系统 Now Playing：
-
-- 开始前是暂停：结束后仍然暂停。
-- 开始前是播放：开始时暂停，结束后恢复。
-- 用的是明确的 Pause / Play，不是播放暂停 toggle。
-
-记录文件：
+记录文件在：
 
 ```text
 ~/Desktop/豆包语音输入记录.md
 ```
+
+## 工作流程
+
+启动语音：
+
+1. 记住当前输入法。
+2. 检查系统 Now Playing 状态，必要时暂停音乐。
+3. 启动文字记录器，盯住当前输入框。
+4. 切换到豆包输入法。
+5. 等待短暂启动间隔。
+6. 触发豆包内部语音快捷键。
+
+结束语音：
+
+1. 触发豆包内部语音快捷键，结束语音。
+2. 发送记录器停止信号。
+3. 立刻切回原输入法。
+4. 按启动前的状态恢复音乐。
+5. 把新增文字写入桌面记录。
+
+这版不做额外执行锁，也不扫豆包语音小窗。逻辑目标是短、直、少干扰。
 
 ## 安装
 
@@ -60,67 +65,91 @@
 xcode-select --install
 ```
 
-然后在仓库目录执行：
+安装 helper：
 
 ```zsh
 ./install.sh
 ```
 
-helper 会安装到：
+安装后位置：
 
 ```text
 ~/Library/Application Support/DoubaoVoiceToggle/doubao-voice-toggle
 ```
 
-## Keyboard Maestro
+## Keyboard Maestro 配置
 
-导入宏：
+仓库里带了一个宏：
 
 ```text
 keyboard-maestro/DoubaoVoiceToggle-CmdBackslash.kmmacros
 ```
 
-默认快捷键是：
+默认外部快捷键是：
 
 ```text
 Command + \
 ```
 
-你也可以自己建一个宏，Shell 内容填：
+也可以自己建 Keyboard Maestro 宏，Shell 内容填：
 
 ```zsh
 #!/bin/zsh
 "$HOME/Library/Application Support/DoubaoVoiceToggle/doubao-voice-toggle"
 ```
 
-## 豆包输入法设置
+## 豆包输入法配置
 
-豆包设置可以这样打开：
+打开豆包输入法设置：
 
 ```zsh
 open "/Library/Input Methods/DoubaoIme.app/Contents/DoubaoImeSettings.app"
 ```
 
-确认两件事：
+确认：
 
 - 语音快捷键：`右 Command + 右 Option`
-- 麦克风：选你要用的固定麦克风
+- 麦克风：选固定设备，不要让它乱跳
 
-## 权限
+## macOS 权限
 
-需要 macOS 辅助功能权限：
+需要辅助功能权限：
 
 - Keyboard Maestro
 - Keyboard Maestro Engine
 - 这个 helper，如果系统单独提示过
 
-语音没声音，就看麦克风权限：
+路径：
+
+```text
+系统设置 -> 隐私与安全性 -> 辅助功能
+```
+
+如果语音没声音，检查麦克风权限：
 
 ```text
 系统设置 -> 隐私与安全性 -> 麦克风
 ```
 
-## 排查
+## 常用命令
+
+查看当前输入法：
+
+```zsh
+"$HOME/Library/Application Support/DoubaoVoiceToggle/doubao-voice-toggle" current
+```
+
+检查辅助功能权限：
+
+```zsh
+"$HOME/Library/Application Support/DoubaoVoiceToggle/doubao-voice-toggle" access
+```
+
+重置状态：
+
+```zsh
+"$HOME/Library/Application Support/DoubaoVoiceToggle/doubao-voice-toggle" reset
+```
 
 看日志：
 
@@ -128,20 +157,28 @@ open "/Library/Input Methods/DoubaoIme.app/Contents/DoubaoImeSettings.app"
 tail -f "$HOME/Library/Application Support/DoubaoVoiceToggle/doubao-voice-toggle.log"
 ```
 
-日志只保留少量状态和错误信息，会自动截断，避免无限变大。
+日志只保留少量状态和错误信息，并限制大小，避免无限增长。
 
 ## 可调参数
 
-源码在：
+源码：
 
 ```text
 src/DoubaoVoiceToggle.swift
 ```
 
-常改的是启动等待：
+最常改的是启动等待：
 
 ```swift
 private let doubaoVoiceStartDelay: TimeInterval = 0.3
 ```
 
-如果豆包偶尔慢，可以调到 `0.5`。
+如果豆包启动语音偶尔慢，可以试 `0.5`；如果机器反应很快，可以继续用 `0.3`。
+
+## 说明
+
+这是个人日用工具，不是通用输入法框架。它主要解决一个很具体的问题：
+
+> 保持平时正常使用双拼/系统输入法，需要语音时临时切到豆包，结束后自动回去，并留下文字记录。
+
+如果你的豆包输入法版本、内部快捷键或 macOS 权限状态不同，需要先按上面的配置对齐。

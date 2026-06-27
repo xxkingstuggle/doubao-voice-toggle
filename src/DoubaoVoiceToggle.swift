@@ -10,9 +10,6 @@ private let rightCommandKeyCode: Int64 = 54
 private let rightOptionKeyCode: Int64 = 61
 private let doubaoVoiceStartDelay: TimeInterval = 0.3
 private let doubaoInputSourceReadyTimeout: TimeInterval = 1.0
-private let doubaoVoicePanelCheckTimeout: TimeInterval = 0.5
-private let doubaoVoicePanelRetryDelay: TimeInterval = 0.1
-private let doubaoVoiceShortcutMaxAttempts = 5
 private let doubaoVoiceStartShortcutHold: useconds_t = 450_000
 private let doubaoVoiceStopShortcutHold: useconds_t = 250_000
 
@@ -32,7 +29,6 @@ private let logFile = supportDirectory.appendingPathComponent("doubao-voice-togg
 private let maxLogFileBytes: UInt64 = 512 * 1024
 private let activeRecordSessionFile = supportDirectory.appendingPathComponent("active-record-session")
 private let mediaRestoreFile = supportDirectory.appendingPathComponent("media-restore-after-stop")
-private let cancelStartFile = supportDirectory.appendingPathComponent("cancel-start")
 private let historyFile = FileManager.default
     .urls(for: .desktopDirectory, in: .userDomainMask)[0]
     .appendingPathComponent("豆包语音输入记录.md")
@@ -152,47 +148,6 @@ private func recordStopFile(_ sessionID: String) -> URL {
 
 private func recordDoneFile(_ sessionID: String) -> URL {
     supportDirectory.appendingPathComponent("record-\(sessionID).done")
-}
-
-private func withFileLock(_ name: String, _ body: () throws -> Void) throws {
-    try? FileManager.default.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
-    let lockFile = supportDirectory.appendingPathComponent(name)
-    let fd = open(lockFile.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
-    guard fd >= 0 else {
-        try body()
-        return
-    }
-    defer {
-        flock(fd, LOCK_UN)
-        close(fd)
-    }
-    flock(fd, LOCK_EX)
-    try body()
-}
-
-private func withToggleLock(_ body: () throws -> Void) throws {
-    try? FileManager.default.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
-    let lockFile = supportDirectory.appendingPathComponent("toggle.lock")
-    let fd = open(lockFile.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
-    guard fd >= 0 else {
-        log("toggle lock open failed; running without lock; errno=\(errno)")
-        try body()
-        return
-    }
-
-    guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
-        close(fd)
-        try? "cancel".write(to: cancelStartFile, atomically: true, encoding: .utf8)
-        log("toggle lock busy; cancel requested instead of waiting; cancelFile=\(cancelStartFile.path); errno=\(errno)")
-        print("busy-cancel-requested")
-        return
-    }
-
-    defer {
-        flock(fd, LOCK_UN)
-        close(fd)
-    }
-    try body()
 }
 
 private func stringProperty(_ source: TISInputSource, _ key: CFString) -> String? {
@@ -383,122 +338,8 @@ private func tapDoubaoVoiceShortcut(holdDuration: useconds_t) throws {
     try postModifier(keyCode: rightCommandKeyCode, flags: [])
 }
 
-private struct WindowInfo {
-    let ownerName: String
-    let windowName: String
-    let layer: Int
-    let alpha: Double
-    let x: Int
-    let y: Int
-    let width: Int
-    let height: Int
-
-    var isVisibleCandidate: Bool {
-        alpha > 0.05 && width >= 80 && height >= 20
-    }
-
-    var isVoicePanelCandidate: Bool {
-        layer == 3 && alpha > 0.05 && width >= 90 && width <= 180 && height >= 24 && height <= 48
-    }
-
-    var summary: String {
-        let namePart = windowName.isEmpty ? "" : " name=\(windowName)"
-        return "\(ownerName)\(namePart) layer=\(layer) alpha=\(String(format: "%.2f", alpha)) frame=\(x),\(y),\(width),\(height)"
-    }
-}
-
-private func doubaoInputMethodWindows() -> [WindowInfo] {
-    guard let windows = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] else {
-        return []
-    }
-
-    return windows.compactMap { window -> WindowInfo? in
-        let ownerName = window[kCGWindowOwnerName as String] as? String ?? ""
-        let lowerOwner = ownerName.lowercased()
-        guard ownerName.contains("豆包输入法") || lowerOwner.contains("doubaoime") else {
-            return nil
-        }
-
-        let bounds = window[kCGWindowBounds as String] as? [String: Any] ?? [:]
-        return WindowInfo(
-            ownerName: ownerName,
-            windowName: window[kCGWindowName as String] as? String ?? "",
-            layer: window[kCGWindowLayer as String] as? Int ?? 0,
-            alpha: window[kCGWindowAlpha as String] as? Double ?? 0,
-            x: bounds["X"] as? Int ?? 0,
-            y: bounds["Y"] as? Int ?? 0,
-            width: bounds["Width"] as? Int ?? 0,
-            height: bounds["Height"] as? Int ?? 0
-        )
-    }
-}
-
-private func doubaoVoicePanelVisible() -> Bool {
-    doubaoInputMethodWindows().contains { $0.isVoicePanelCandidate }
-}
-
-@discardableResult
-private func waitForDoubaoVoicePanel(timeout: TimeInterval) -> Bool {
-    let deadline = Date().addingTimeInterval(timeout)
-    while Date() < deadline {
-        if doubaoVoicePanelVisible() {
-            return true
-        }
-        usleep(80_000)
-    }
-    return doubaoVoicePanelVisible()
-}
-
-@discardableResult
-private func waitBeforeNextDoubaoVoiceRetry(timeout: TimeInterval) -> Bool {
-    let deadline = Date().addingTimeInterval(timeout)
-    while Date() < deadline {
-        if FileManager.default.fileExists(atPath: cancelStartFile.path) {
-            return false
-        }
-        if doubaoVoicePanelVisible() {
-            return true
-        }
-        if let sourceID = currentSourceID(), !isDoubaoSourceID(sourceID) {
-            return false
-        }
-        usleep(100_000)
-    }
-    return doubaoVoicePanelVisible()
-}
-
-private func startDoubaoVoiceWithVerification() throws -> Bool {
-    for attempt in 1...doubaoVoiceShortcutMaxAttempts {
-        if FileManager.default.fileExists(atPath: cancelStartFile.path) {
-            return false
-        }
-        if attempt > 1, doubaoVoicePanelVisible() {
-            return true
-        }
-        if let sourceID = currentSourceID(), !isDoubaoSourceID(sourceID) {
-            return false
-        }
-
-        if attempt > 1 {
-            log("voice panel missing; retrying internal shortcut; attempt=\(attempt)")
-        }
-
-        try tapDoubaoVoiceShortcut(holdDuration: doubaoVoiceStartShortcutHold)
-        let visible = waitForDoubaoVoicePanel(timeout: doubaoVoicePanelCheckTimeout)
-
-        if visible {
-            return true
-        }
-
-        if attempt < doubaoVoiceShortcutMaxAttempts {
-            if waitBeforeNextDoubaoVoiceRetry(timeout: doubaoVoicePanelRetryDelay) {
-                return true
-            }
-        }
-    }
-
-    log("voice start verification failed after all attempts")
-    return false
+private func triggerDoubaoVoiceStart() throws {
+    try tapDoubaoVoiceShortcut(holdDuration: doubaoVoiceStartShortcutHold)
 }
 
 private struct FocusedTextTarget {
@@ -636,11 +477,9 @@ App：\(target.appName)\(bundle)
 """
 
     do {
-        try withFileLock("history.lock") {
-            let existing = (try? String(contentsOf: historyFile, encoding: .utf8)) ?? ""
-            let content = historyContentByPrepending(entry: entry, existing: existing)
-            try content.write(to: historyFile, atomically: true, encoding: .utf8)
-        }
+        let existing = (try? String(contentsOf: historyFile, encoding: .utf8)) ?? ""
+        let content = historyContentByPrepending(entry: entry, existing: existing)
+        try content.write(to: historyFile, atomically: true, encoding: .utf8)
     } catch {
         log("history write failed: \(error.localizedDescription)")
     }
@@ -888,7 +727,6 @@ private func listSources() {
 private func toggle() throws {
     let fm = FileManager.default
     try fm.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
-    try? fm.removeItem(at: cancelStartFile)
 
     guard let current = currentSourceID() else {
         throw NSError(domain: "DoubaoVoiceToggle", code: 1,
@@ -947,12 +785,9 @@ private func toggle() throws {
         if elapsed < doubaoVoiceStartDelay {
             usleep(useconds_t((doubaoVoiceStartDelay - elapsed) * 1_000_000))
         }
-        let panelVisible = try startDoubaoVoiceWithVerification()
-        if !panelVisible {
-            log("voice panel still missing after retries; input source remains \(currentSourceID() ?? "unknown")")
-            throw NSError(domain: "DoubaoVoiceToggle", code: 15,
-                          userInfo: [NSLocalizedDescriptionKey: "豆包语音输入框未出现"])
-        }
+
+        try triggerDoubaoVoiceStart()
+
         log("started; restore=\(previous)")
         print("started\t\(previous)")
     } catch {
@@ -960,7 +795,6 @@ private func toggle() throws {
         resumeMediaIfPausedForVoiceSession()
         _ = selectSource(id: previous)
         try? fm.removeItem(at: stateFile)
-        try? fm.removeItem(at: cancelStartFile)
         log("start failed: \(error.localizedDescription)")
         throw error
     }
@@ -988,25 +822,15 @@ do {
     case "media-resume":
         resumeMediaIfPausedForVoiceSession()
         print("resume-requested")
-    case "voice-windows":
-        let windows = doubaoInputMethodWindows()
-        print("voicePanelCandidates=\(windows.filter { $0.isVoicePanelCandidate }.count)")
-        print("visibleCandidates=\(windows.filter { $0.isVisibleCandidate }.count)")
-        for window in windows {
-            print(window.summary)
-        }
     case "reset":
         try? FileManager.default.removeItem(at: stateFile)
         try? FileManager.default.removeItem(at: mediaRestoreFile)
-        try? FileManager.default.removeItem(at: cancelStartFile)
         print("reset")
     case "select":
         guard CommandLine.arguments.count >= 3 else { exit(64) }
         exit(selectSource(id: CommandLine.arguments[2]) ? 0 : 1)
     default:
-        try withToggleLock {
-            try toggle()
-        }
+        try toggle()
     }
 } catch {
     log("error: \(error.localizedDescription)")

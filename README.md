@@ -24,9 +24,7 @@
 3. 启动记录器，盯住当前输入框。
 4. 切到豆包输入法。
 5. 按豆包内部语音快捷键：`右 Command + 右 Option`，两个键同时落下，不插入间隔。
-6. 检查黑色胶囊语音小窗；没出现就短间隔快速补按，最多 5 次。
-7. 还是没出现，就恢复原输入法，不把你卡在豆包里。
-8. 重试期间再按一次外部快捷键，会取消这次启动。
+6. 不做额外锁等待，也不再扫语音小窗；按键链路尽量短。
 
 结束时：
 
@@ -131,15 +129,6 @@ tail -f "$HOME/Library/Application Support/DoubaoVoiceToggle/doubao-voice-toggle
 ```
 
 日志只保留少量状态和错误信息，会自动截断，避免无限变大。
-
-看豆包语音小窗：
-
-```zsh
-"$HOME/Library/Application Support/DoubaoVoiceToggle/doubao-voice-toggle" voice-windows
-```
-
-正常录音时，`voicePanelCandidates` 应该大于 `0`。
-它识别的是黑色胶囊、蓝色波浪那个小窗，不是豆包常驻窗口。
 
 ## 可调参数
 

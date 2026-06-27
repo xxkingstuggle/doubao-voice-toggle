@@ -40,6 +40,7 @@ private let recorderMaxStopWait: TimeInterval = 4.0
 private let recorderSupersededGraceWait: TimeInterval = 0.4
 private let recorderMaxSessionDuration: TimeInterval = 900.0
 private let previousRecorderSettleWait: TimeInterval = 1.0
+private let recorderTempFileMaxAge: TimeInterval = 24 * 60 * 60
 private let historyTitle = "# 豆包语音输入记录"
 private let mediaWasPlayingMarker = "system-now-playing-was-playing"
 private let mediaRemoteFrameworkPath = "/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote"
@@ -148,6 +149,35 @@ private func recordStopFile(_ sessionID: String) -> URL {
 
 private func recordDoneFile(_ sessionID: String) -> URL {
     supportDirectory.appendingPathComponent("record-\(sessionID).done")
+}
+
+private func cleanupOldRecorderTempFiles() {
+    let activeSessionID = readTrimmed(activeRecordSessionFile)
+    guard let files = try? FileManager.default.contentsOfDirectory(
+        at: supportDirectory,
+        includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey]
+    ) else {
+        return
+    }
+
+    let cutoff = Date().addingTimeInterval(-recorderTempFileMaxAge)
+    for file in files {
+        let name = file.lastPathComponent
+        guard name.hasPrefix("record-"),
+              name.hasSuffix(".ready") || name.hasSuffix(".stop") || name.hasSuffix(".done") else {
+            continue
+        }
+        if let activeSessionID, !activeSessionID.isEmpty, name.contains(activeSessionID) {
+            continue
+        }
+        guard let values = try? file.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey]),
+              values.isRegularFile == true,
+              let modifiedAt = values.contentModificationDate,
+              modifiedAt < cutoff else {
+            continue
+        }
+        try? FileManager.default.removeItem(at: file)
+    }
 }
 
 private func stringProperty(_ source: TISInputSource, _ key: CFString) -> String? {
@@ -635,6 +665,7 @@ private func executablePath() -> String {
 
 private func startRecorder() {
     settlePreviousRecorderBeforeStart()
+    cleanupOldRecorderTempFiles()
 
     let sessionID = UUID().uuidString
     try? FileManager.default.removeItem(at: recordReadyFile(sessionID))
